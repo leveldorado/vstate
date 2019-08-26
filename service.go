@@ -4,33 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
-	"github.com/leveldorado/vstate/user"
 	"github.com/pkg/errors"
 )
-
-/*
-Service manages vehicle state
-*/
-type Service struct{}
-
-/*
-ChangeState changes vehicle state
- if state is not valid returns an error
- if state is valid returns nil
-*/
-func (s *Service) ChangeState(ctx context.Context, vehicleID string, st VehicleState, role user.Role) error {
-
-	return nil
-}
-
-/*
-GetState returns current state of vehicle
-*/
-func (s *Service) GetState(ctx context.Context, vehicleID string) (VehicleState, error) {
-	return "", nil
-}
 
 /*
 VehicleState of vehicle
@@ -66,11 +44,11 @@ const (
 )
 
 type Vehicle struct {
-	ID            string
-	State         VehicleState
-	LastUpdatedAt time.Time
-	Handled       bool
-	TimeLocation  time.Location
+	ID                 string
+	State              VehicleState
+	LastStateUpdatedAt time.Time
+	Handled            bool
+	TimeLocation       time.Location
 }
 
 type vehicleHandlingLock struct {
@@ -87,7 +65,7 @@ func (ErrPrimaryKeyDuplicated) Error() string {
 type vehicleRepo interface {
 	ListNotHandled(ctx context.Context, limit int) ([]Vehicle, error)
 	UpdateState(ctx context.Context, id string, s VehicleState, t time.Time) error
-	UpdateHandled(ctx context.Context, id string, handled bool, t time.Time) error
+	UpdateHandled(ctx context.Context, id string, handled bool) error
 }
 
 type vehicleHandlingLockRepo interface {
@@ -95,61 +73,65 @@ type vehicleHandlingLockRepo interface {
 	Delete(ctx context.Context, id string) error
 }
 
-type ChangeStateHandler struct {
-	handledVehiclesLimit    int
-	vehicleRepo             vehicleRepo
-	vehicleHandlingLockRepo vehicleHandlingLockRepo
+type VehicleStateChangeHandler struct {
+	handledVehiclesLimit   int
+	vehicleRepo            vehicleRepo
+	lockRepo               vehicleHandlingLockRepo
+	subscriber             subscriber
+	publisher              publisher
+	unknownStateTickGetter unknownStateTickGetter
+	wg                     *sync.WaitGroup
 }
 
-type StateHandlerQueue interface {
-	RegisterVehicle(ctx context.Context, vehicleID string) error
-	GetState(ctx context.Context, vehicleID string) (VehicleState, error)
-	GetStateAndLock(ctx context.Context, vehicleID string) (s VehicleState, lockID string, err error)
-	ChangeState(ctx context.Context, vehicleID, lockID string, s VehicleState) error
+type unknownStateTickGetter interface {
+	GetUnknownStateTick(lastUpdatedAt time.Time) chan time.Time
 }
 
-type DefaultStateHandlerQueue struct {
+type subscriber interface {
+	Subscribe(ctx context.Context, topic string) (<-chan VehicleStateChangeRequest, error)
 }
 
-type vehicleStateQueue struct {
-	currentState VehicleState
-	in           chan<- stateChangeMessage
-	out          <-chan stateChangeResult
+type publisher interface {
+	Publish(ctx context.Context, topic string, request VehicleStateChangeRequest) error
 }
 
-type stateChangeMessage struct {
-	LockID    string
-	VehicleID string
-	State     VehicleState
+type VehicleStateChangeRequest struct {
+	VehicleID    string
+	State        VehicleState
+	ResponseChan chan<- VehicleStateChangeResponse
 }
 
-type stateChangeResult struct {
+type VehicleStateChangeResponse struct {
+	LockID string
+	Error  string
 }
 
-func (q *DefaultStateHandlerQueue) RegisterVehicle(ctx context.Context, vehicleID string) error {
-
-}
-
-func (h *ChangeStateHandler) Handle(ctx context.Context) (*StateHandlerQueue, error) {
+func (h *VehicleStateChangeHandler) Init(ctx context.Context) error {
 	rp := &rollbacksPull{}
 	defer rp.rollback()
 	vehiclesToHandle, err := h.getVehiclesToHandle(ctx, rp)
 	if err != nil {
-		return nil, errors.Wrap(err, `failed to get vehicles to handle`)
+		return errors.Wrap(err, `failed to get vehicles to handle`)
 	}
-	q := DefaultStateHandlerQueue{}
+	h.wg = &sync.WaitGroup{}
 	for _, v := range vehiclesToHandle {
-
+		ch, err := h.subscriber.Subscribe(ctx, v.ID)
+		if err != nil {
+			return errors.Wrapf(err, `failed to subscribe to vehicle state change: [id: %s]`, v.ID)
+		}
+		go h.handleStateChange(ctx, v, ch)
 	}
+	h.wg.Add(len(vehiclesToHandle))
 	rp.commit()
 	return nil
 }
 
-func (h *ChangeStateHandler) handleStateChange(ctx context.Context, vehicleID string) {
+func (h *VehicleStateChangeHandler) handleStateChange(ctx context.Context, v Vehicle, requestChan <-chan VehicleStateChangeRequest) {
+
 	return
 }
 
-func (h *ChangeStateHandler) getVehiclesToHandle(ctx context.Context, rp *rollbacksPull) ([]Vehicle, error) {
+func (h *VehicleStateChangeHandler) getVehiclesToHandle(ctx context.Context, rp *rollbacksPull) ([]Vehicle, error) {
 	var vehiclesToHandle []Vehicle
 	for {
 		if len(vehiclesToHandle) == h.handledVehiclesLimit {
@@ -177,9 +159,9 @@ func (h *ChangeStateHandler) getVehiclesToHandle(ctx context.Context, rp *rollba
 	return vehiclesToHandle, nil
 }
 
-func (h *ChangeStateHandler) acquireVehicleForHandling(ctx context.Context, id string, rp *rollbacksPull) (bool, error) {
+func (h *VehicleStateChangeHandler) acquireVehicleForHandling(ctx context.Context, id string, rp *rollbacksPull) (bool, error) {
 	lockEntry := vehicleHandlingLock{VehicleID: id, CreatedAt: time.Now().UTC()}
-	err := h.vehicleHandlingLockRepo.Create(ctx, lockEntry)
+	err := h.lockRepo.Create(ctx, lockEntry)
 	switch errors.Cause(err).(type) {
 	case ErrPrimaryKeyDuplicated:
 		return false, nil
@@ -188,13 +170,13 @@ func (h *ChangeStateHandler) acquireVehicleForHandling(ctx context.Context, id s
 		return false, errors.Wrapf(err, `failed to save vehicle handling lock: [doc: %+v]`, lockEntry)
 	}
 	rp.addRollback(func() error {
-		return errors.Wrapf(h.vehicleHandlingLockRepo.Delete(ctx, id), `failed to delete vehicle handling lock: [id: %s]`, id)
+		return errors.Wrapf(h.lockRepo.Delete(ctx, id), `failed to delete vehicle handling lock: [id: %s]`, id)
 	})
-	if err = h.vehicleRepo.UpdateHandled(ctx, id, true, time.Now().UTC()); err != nil {
+	if err = h.vehicleRepo.UpdateHandled(ctx, id, true); err != nil {
 		return false, errors.Wrapf(err, `failed to update handled: [id: %s, handled: %v]`, id, true)
 	}
 	rp.addRollback(func() error {
-		return errors.Wrapf(h.vehicleRepo.UpdateHandled(ctx, id, false, time.Now().UTC()), `failed to update vehicle: [id: %s, handled: %v]`, id, false)
+		return errors.Wrapf(h.vehicleRepo.UpdateHandled(ctx, id, false), `failed to update vehicle: [id: %s, handled: %v]`, id, false)
 	})
 	return true, nil
 }
