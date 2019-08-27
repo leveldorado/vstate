@@ -78,15 +78,15 @@ type vehicleHandlingLockRepo interface {
 }
 
 type VehicleStateChangeHandler struct {
-	handledVehiclesLimit   int
-	waitingLocksBufferSize int
-	batteryLimitForReady   float64
-	vehicleRepo            vehicleRepo
-	lockRepo               vehicleHandlingLockRepo
-	subscriber             subscriber
-	publisher              publisher
-	tickGetter             tickGetter
-	wg                     *sync.WaitGroup
+	handledVehiclesLimit int
+	batteryLimitForReady float64
+	vehicleRepo          vehicleRepo
+	lockRepo             vehicleHandlingLockRepo
+	subscriber           subscriber
+	publisher            publisher
+	tickGetter           tickGetter
+	wg                   *sync.WaitGroup
+	waitResponseTimeout  time.Duration
 }
 
 type tickGetter interface {
@@ -153,6 +153,42 @@ func (h *VehicleStateChangeHandler) Init(ctx context.Context) error {
 	h.wg.Add(len(vehiclesToHandle))
 	rp.commit()
 	return nil
+}
+
+func (h *VehicleStateChangeHandler) GetState(ctx context.Context, vehicleID string) (VehicleState, error) {
+	responseChan := make(chan VehicleStateChangeResponse, 1)
+	req := VehicleStateChangeRequest{Operation: RequestOperationGet, ResponseChan: responseChan}
+	if err := h.publisher.Publish(ctx, vehicleID, req); err != nil {
+		return "", errors.Wrapf(err, `failed to publish request: [req: %+v, topic: %s]`, req, vehicleID)
+	}
+	resp, err := waitResponseWithTimeout(responseChan, h.waitResponseTimeout)
+	if err != nil {
+		return "", err
+	}
+	if resp.Error != "" {
+		return "", errors.New(resp.Error)
+	}
+	return resp.State, nil
+}
+
+func (h *VehicleStateChangeHandler) UpdateState(ctx context.Context, vehicleID string, s VehicleState) error {
+	return nil
+}
+
+type ErrWaitingResponseTimeout struct {
+}
+
+func (ErrWaitingResponseTimeout) Error() string {
+	return "Timeout for waiting response exceed"
+}
+
+func waitResponseWithTimeout(c <-chan VehicleStateChangeResponse, t time.Duration) (VehicleStateChangeResponse, error) {
+	select {
+	case <-time.After(t):
+		return VehicleStateChangeResponse{}, ErrWaitingResponseTimeout{}
+	case resp := <-c:
+		return resp, nil
+	}
 }
 
 func (h *VehicleStateChangeHandler) handleStateChange(ctx context.Context, v Vehicle, requestChan <-chan VehicleStateChangeRequest) {
