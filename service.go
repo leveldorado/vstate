@@ -82,8 +82,8 @@ type vehicleHandlingLockRepo interface {
 }
 
 type tickGetter interface {
-	GetUnknownStateTick(lastUpdatedAt time.Time) chan time.Time
-	GetLateTick(location time.Location) chan time.Time
+	GetUnknownStateTick(lastUpdatedAt time.Time) <-chan time.Time
+	GetLateTick(location time.Location) <-chan time.Time
 }
 
 type subscriber interface {
@@ -104,7 +104,7 @@ type ChangeRequest struct {
 }
 
 const (
-	DefaultLockTTL = 10 * time.Second
+	DefaultLockTTL = 5 * time.Second
 )
 
 type RequestOperation string
@@ -113,6 +113,7 @@ const (
 	RequestOperationGet        = "get"
 	RequestOperationGetAndLock = "get_and_lock"
 	RequestOperationUpdate     = "update"
+	RequestOperationUnlock     = "unlock"
 )
 
 type ChangeResponse struct {
@@ -138,7 +139,30 @@ type ChangeHandlerConfig struct {
 	WaitResponseTimeout time.Duration
 }
 
+const (
+	defaultVehiclesHandledLimit = 100
+	defaultBatteryLimitForReady = float64(20)
+	defaultWaitResponseTimeout  = 10 * time.Second
+)
+
+/*
+NewChangeHandler creates instance of ChangeHandler and initializes it.
+Context can be used to stop instance, to do stop it just cancel context.
+WaitGroup can be used for waiting until all routines started by handler will be stopped.
+*/
 func NewChangeHandler(ctx context.Context, vr vehicleRepo, lr vehicleHandlingLockRepo, b batteryLevelChecker, s subscriber, p publisher, t tickGetter, cfg ChangeHandlerConfig, wg *sync.WaitGroup) (*ChangeHandler, error) {
+	if cfg.HandleVehiclesLimit == 0 {
+		cfg.HandleVehiclesLimit = defaultVehiclesHandledLimit
+	}
+	if cfg.BatterLimitForReady == 0 {
+		cfg.BatterLimitForReady = defaultBatteryLimitForReady
+	}
+	if cfg.WaitResponseTimeout == 0 {
+		cfg.WaitResponseTimeout = defaultWaitResponseTimeout
+	}
+	if wg == nil {
+		wg = &sync.WaitGroup{}
+	}
 	c := &ChangeHandler{
 		config:              cfg,
 		vehicleRepo:         vr,
@@ -198,14 +222,17 @@ func (h *ChangeHandler) UpdateState(ctx context.Context, vehicleID string, s Sta
 		return err
 	}
 	if resp.State == s {
+		h.sendUnlock(ctx, vehicleID, resp.LockID)
 		return nil
 	}
 	if err = checkIsStateCanBeChanged(resp.State, s, r); err != nil {
+		h.sendUnlock(ctx, vehicleID, resp.LockID)
 		return err
 	}
 	if s == Ready {
 		batteryLevel, err := h.batteryLevelChecker.CheckBatteryLevel(ctx, vehicleID)
 		if err != nil {
+			h.sendUnlock(ctx, vehicleID, resp.LockID)
 			return errors.Wrapf(err, `failed to check battery level: [vehicle_id: %s]`, vehicleID)
 		}
 		if batteryLevel < h.config.BatterLimitForReady {
@@ -225,6 +252,13 @@ func (h *ChangeHandler) UpdateState(ctx context.Context, vehicleID string, s Sta
 		return errors.New(resp.Error)
 	}
 	return nil
+}
+
+func (h *ChangeHandler) sendUnlock(ctx context.Context, vehicleID, lockID string) {
+	req := ChangeRequest{Operation: RequestOperationUnlock, LockID: lockID}
+	if err := h.publisher.Publish(ctx, vehicleID, req); err != nil {
+		log.Println(fmt.Sprintf(`failed to publish request: [vehicle_id: %s, req: %+v]`, vehicleID, req))
+	}
 }
 
 type ErrNotAllowedStateChange struct {
@@ -297,13 +331,15 @@ func (h *ChangeHandler) handleStateChange(ctx context.Context, v Vehicle, reques
 	currentState := v.State
 	var lockID string
 	var waitingLocks []ChangeRequest
-	lockTTLChan := make(<-chan time.Time, 0)
+	lockExpiredChan := make(chan string, 1)
 	for {
 		select {
 		case <-ctx.Done():
 			if err := h.vehicleRepo.UpdateHandled(context.Background(), v.ID, false); err != nil {
 				log.Println(fmt.Sprintf(`failed to update handled to false: [vehicle_id: %s]`, v.ID))
 			}
+			h.wg.Done()
+			return
 		case <-unknownStateTick:
 			currentState = Unknown
 			if err := h.vehicleRepo.UpdateState(ctx, v.ID, currentState); err != nil {
@@ -318,38 +354,29 @@ func (h *ChangeHandler) handleStateChange(ctx context.Context, v Vehicle, reques
 			if err := h.vehicleRepo.UpdateState(ctx, v.ID, currentState); err != nil {
 				log.Println(fmt.Sprintf(`failed to update vehicle state: [vehicle_id: %s, state: %s]`, v.ID, currentState))
 			}
-		case <-lockTTLChan:
-			lockID = ""
-			indexToTruncate := len(waitingLocks)
-			for i, req := range waitingLocks {
-				sub := time.Now().Sub(req.receivedAt) - req.LockTTL
-				if sub < 0 {
-					continue
-				}
-				indexToTruncate = i + 1
-				lockID = uuid.New().String()
-				lockTTLChan = time.After(sub)
-				req.ResponseChan <- ChangeResponse{LockID: lockID, State: currentState}
-				close(req.ResponseChan)
+		case expiredLockID := <-lockExpiredChan:
+			if expiredLockID != lockID {
 				break
 			}
-			waitingLocks = waitingLocks[indexToTruncate:]
+			lockID, waitingLocks = handleGetAndLock(currentState, lockExpiredChan, waitingLocks...)
 		case req := <-requestChan:
 			switch req.Operation {
 			case RequestOperationGet:
 				req.ResponseChan <- ChangeResponse{State: currentState}
+			case RequestOperationUnlock:
+				if lockID == req.LockID {
+					lockID = ""
+				}
 			case RequestOperationGetAndLock:
 				if req.LockTTL == 0 {
 					req.LockTTL = DefaultLockTTL
 				}
+				req.receivedAt = time.Now()
 				if lockID != "" {
-					req.receivedAt = time.Now()
 					waitingLocks = append(waitingLocks, req)
 					break
 				}
-				lockID = uuid.New().String()
-				lockTTLChan = time.After(req.LockTTL)
-				req.ResponseChan <- ChangeResponse{LockID: lockID, State: currentState}
+				lockID, waitingLocks = handleGetAndLock(currentState, lockExpiredChan, req)
 			case RequestOperationUpdate:
 				if req.LockID != lockID {
 					req.ResponseChan <- ChangeResponse{Error: fmt.Sprintf(`wrong lock id: %s`, req.LockID)}
@@ -358,6 +385,7 @@ func (h *ChangeHandler) handleStateChange(ctx context.Context, v Vehicle, reques
 				bounty, err := h.shouldSetBounty(ctx, v.ID, req.State, currentState, lateTickDone)
 				if err != nil {
 					req.ResponseChan <- ChangeResponse{Error: fmt.Sprintf(`failed to check should set bounty: [error: %s]`, err)}
+					break
 				}
 				currentState = req.State
 				if bounty {
@@ -366,23 +394,48 @@ func (h *ChangeHandler) handleStateChange(ctx context.Context, v Vehicle, reques
 				now := time.Now().UTC()
 				if err = h.vehicleRepo.UpdateStateAndLastStateUpdatedAt(ctx, v.ID, currentState, now); err != nil {
 					req.ResponseChan <- ChangeResponse{Error: fmt.Sprintf(`failed to update vehicle state: [vehicle_id: %s, state: %s]`, v.ID, currentState)}
+					break
 				}
+				req.ResponseChan <- ChangeResponse{State: currentState}
 				unknownStateTick = h.tickGetter.GetUnknownStateTick(now)
+				lockID, waitingLocks = handleGetAndLock(currentState, lockExpiredChan, waitingLocks...)
 			default:
 				req.ResponseChan <- ChangeResponse{Error: fmt.Sprintf(`unsupported operation: %s`, req.Operation)}
 			}
-			close(req.ResponseChan)
 		}
 	}
-	h.wg.Done()
+}
+
+func handleGetAndLock(current State, lockExpiredChan chan<- string, requests ...ChangeRequest) (lockID string, waitingLocks []ChangeRequest) {
+	if len(requests) == 0 {
+		return
+	}
+	indexToTruncate := len(requests)
+	for i, req := range requests {
+		now := time.Now()
+		if now.After(now.Add(req.LockTTL)) {
+			continue
+		}
+		indexToTruncate = i + 1
+		lockID = uuid.New().String()
+		go sendExpiredLockMessage(lockID, req.LockTTL, lockExpiredChan)
+		req.ResponseChan <- ChangeResponse{LockID: lockID, State: current}
+		break
+	}
+	waitingLocks = requests[indexToTruncate:]
 	return
+}
+
+func sendExpiredLockMessage(lockID string, lockTTL time.Duration, lockExpiredChan chan<- string) {
+	<-time.After(lockTTL)
+	lockExpiredChan <- lockID
 }
 
 func (h *ChangeHandler) shouldSetBounty(ctx context.Context, vehicleID string, requiredState, currentState State, lateTickDone bool) (bool, error) {
 	if requiredState == Ready && lateTickDone {
 		return true, nil
 	}
-	if currentState != BatteryLow {
+	if requiredState != BatteryLow {
 		return false, nil
 	}
 	return true, nil
