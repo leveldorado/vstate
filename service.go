@@ -231,7 +231,25 @@ func checkIsStateCanBeChanged(current, required VehicleState, r UserRole) error 
 			return NewErrNotAllowedStateChange(r, current, required)
 		}
 	}
-	return nil
+	switch current {
+	case VehicleStateReady:
+		if required == VehicleStateRiding {
+			return nil
+		}
+	case VehicleStateRiding, VehicleStateDropped:
+		if required == VehicleStateReady {
+			return nil
+		}
+	case VehicleStateCollected:
+		if required == VehicleStateDropped {
+			return nil
+		}
+	case VehicleStateBounty:
+		if required == VehicleStateCollected {
+			return nil
+		}
+	}
+	return NewErrNotAllowedStateChange(r, current, required)
 }
 
 type ErrWaitingResponseTimeout struct {
