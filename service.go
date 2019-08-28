@@ -87,6 +87,7 @@ type VehicleStateChangeHandler struct {
 	tickGetter           tickGetter
 	wg                   *sync.WaitGroup
 	waitResponseTimeout  time.Duration
+	closeChan            chan struct{}
 }
 
 type tickGetter interface {
@@ -124,16 +125,10 @@ const (
 )
 
 type VehicleStateChangeResponse struct {
-	LockID      string
-	Error       string
-	ErrCode     string
-	State       VehicleState
-	ShouldRetry bool
+	LockID string
+	Error  string
+	State  VehicleState
 }
-
-const (
-	ErrCodeWrongLockID = "wrong_lock_id"
-)
 
 func (h *VehicleStateChangeHandler) Init(ctx context.Context) error {
 	rp := &rollbacksPull{}
@@ -171,7 +166,71 @@ func (h *VehicleStateChangeHandler) GetState(ctx context.Context, vehicleID stri
 	return resp.State, nil
 }
 
-func (h *VehicleStateChangeHandler) UpdateState(ctx context.Context, vehicleID string, s VehicleState) error {
+type UserRole string
+
+const (
+	UserRoleAdmin   UserRole = "Admin"
+	UserRoleEndUser UserRole = "End-user"
+	UserRoleHunter  UserRole = "Hunter"
+)
+
+func (h *VehicleStateChangeHandler) UpdateState(ctx context.Context, vehicleID string, s VehicleState, r UserRole) error {
+	respChan := make(chan VehicleStateChangeResponse, 1)
+	req := VehicleStateChangeRequest{Operation: RequestOperationGetAndLock, ResponseChan: respChan}
+	if err := h.publisher.Publish(ctx, vehicleID, req); err != nil {
+		return errors.Wrapf(err, `failed to publish request: [req: %+v]`, err)
+	}
+	resp, err := waitResponseWithTimeout(respChan, h.waitResponseTimeout)
+	if err != nil {
+		return err
+	}
+	if resp.State == s {
+		return nil
+	}
+	if err = checkIsStateCanBeChanged(resp.State, s, r); err != nil {
+		return err
+	}
+	respChan = make(chan VehicleStateChangeResponse, 1)
+	req = VehicleStateChangeRequest{Operation: RequestOperationUpdate, State: s, ResponseChan: respChan, LockID: resp.LockID}
+	if err = h.publisher.Publish(ctx, vehicleID, req); err != nil {
+		return errors.Wrapf(err, `failed to publish request: [req: %+v]`, err)
+	}
+	resp, err = waitResponseWithTimeout(respChan, h.waitResponseTimeout)
+	if err != nil {
+		return err
+	}
+	if resp.Error != "" {
+		return errors.New(resp.Error)
+	}
+	return nil
+}
+
+type ErrNotAllowedStateChange struct {
+	message string
+}
+
+func (e ErrNotAllowedStateChange) Error() string {
+	return e.message
+}
+
+func NewErrNotAllowedStateChange(r UserRole, current, required VehicleState) ErrNotAllowedStateChange {
+	return ErrNotAllowedStateChange{message: fmt.Sprintf(`user with role %s can not change state from %s to %s`, r, current, required)}
+}
+
+func checkIsStateCanBeChanged(current, required VehicleState, r UserRole) error {
+	if r == UserRoleAdmin {
+		return nil
+	}
+
+	if r == UserRoleEndUser {
+		allowedStatesForEndUsers := map[VehicleState]bool{
+			VehicleStateRiding: true,
+			VehicleStateReady:  true,
+		}
+		if !allowedStatesForEndUsers[current] || !allowedStatesForEndUsers[required] {
+			return NewErrNotAllowedStateChange(r, current, required)
+		}
+	}
 	return nil
 }
 
@@ -253,7 +312,7 @@ func (h *VehicleStateChangeHandler) handleStateChange(ctx context.Context, v Veh
 				req.ResponseChan <- VehicleStateChangeResponse{LockID: lockID, State: currentState}
 			case RequestOperationUpdate:
 				if req.LockID != lockID {
-					req.ResponseChan <- VehicleStateChangeResponse{Error: fmt.Sprintf(`wrong lock id: %s`, req.LockID), ErrCode: ErrCodeWrongLockID}
+					req.ResponseChan <- VehicleStateChangeResponse{Error: fmt.Sprintf(`wrong lock id: %s`, req.LockID)}
 					break
 				}
 				bounty, err := h.shouldSetBounty(ctx, v.ID, req.State, currentState, lateTickDone)
@@ -275,6 +334,7 @@ func (h *VehicleStateChangeHandler) handleStateChange(ctx context.Context, v Veh
 			close(req.ResponseChan)
 		}
 	}
+	h.wg.Done()
 	return
 }
 
