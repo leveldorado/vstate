@@ -8,13 +8,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/leveldorado/vstate/user"
 	"github.com/pkg/errors"
 )
 
 /*
-VehicleState of vehicle
+State of vehicle
 */
-type VehicleState string
+type State string
 
 /*
 Supported states of vehicle
@@ -24,33 +25,32 @@ const (
 	   Operational statutes
 	*/
 	// The vehicle is operational and can be claimed by an end­user
-	VehicleStateReady VehicleState = "Ready"
+	Ready State = "Ready"
 	// The vehicle is low on battery but otherwise operational.
 	// The vehicle cannot be claimed by an end­user but can be claimed by a hunter.
-	VehicleStateBatteryLow VehicleState = "Battery_low"
+	BatteryLow State = "Battery_low"
 	// Only available for “Hunters” to be picked up for charging.
-	VehicleStateBounty VehicleState = "Bounty"
+	Bounty State = "Bounty"
 	// An end user is currently using this vehicle; it can not be claimed by another user or hunter.
-	VehicleStateRiding VehicleState = "Riding"
+	Riding State = "Riding"
 	// A hunter has picked up a vehicle for charging.
-	VehicleStateCollected VehicleState = "Collected"
+	Collected State = "Collected"
 	// A hunter has returned a vehicle after being charged.
-	VehicleStateDropped VehicleState = "Dropped"
+	Dropped State = "Dropped"
 	/*
 	   Not commissioned for service , not claimable by either end­users nor hunters.
 	*/
-	VehicleStateServiceMode VehicleState = "Service_mode"
-	VehicleStateTerminated  VehicleState = "Terminated"
-	VehicleStateUnknown     VehicleState = "Unknown"
+	ServiceMode State = "Service_mode"
+	Terminated  State = "Terminated"
+	Unknown     State = "Unknown"
 )
 
 type Vehicle struct {
 	ID                 string
-	State              VehicleState
+	State              State
 	LastStateUpdatedAt time.Time
 	Handled            bool
 	TimeLocation       time.Location
-	BatteryLevel       float64
 }
 
 type vehicleHandlingLock struct {
@@ -64,10 +64,14 @@ func (ErrPrimaryKeyDuplicated) Error() string {
 	return "Primary key duplicated"
 }
 
+type batteryLevelChecker interface {
+	CheckBatteryLevel(ctx context.Context, vehicleID string) (float64, error)
+}
+
 type vehicleRepo interface {
 	ListNotHandled(ctx context.Context, limit int) ([]Vehicle, error)
-	UpdateStateAndLastStateUpdatedAt(ctx context.Context, id string, s VehicleState, t time.Time) error
-	UpdateState(ctx context.Context, id string, s VehicleState) error
+	UpdateStateAndLastStateUpdatedAt(ctx context.Context, id string, s State, t time.Time) error
+	UpdateState(ctx context.Context, id string, s State) error
 	UpdateHandled(ctx context.Context, id string, handled bool) error
 	GetVehicle(ctx context.Context, id string) (Vehicle, error)
 }
@@ -77,11 +81,12 @@ type vehicleHandlingLockRepo interface {
 	Delete(ctx context.Context, id string) error
 }
 
-type VehicleStateChangeHandler struct {
+type ChangeHandler struct {
 	handledVehiclesLimit int
 	batteryLimitForReady float64
 	vehicleRepo          vehicleRepo
 	lockRepo             vehicleHandlingLockRepo
+	batteryLevelChecker  batteryLevelChecker
 	subscriber           subscriber
 	publisher            publisher
 	tickGetter           tickGetter
@@ -96,16 +101,16 @@ type tickGetter interface {
 }
 
 type subscriber interface {
-	Subscribe(ctx context.Context, topic string) (<-chan VehicleStateChangeRequest, error)
+	Subscribe(ctx context.Context, topic string) (<-chan ChangeRequest, error)
 }
 
 type publisher interface {
-	Publish(ctx context.Context, topic string, request VehicleStateChangeRequest) error
+	Publish(ctx context.Context, topic string, request ChangeRequest) error
 }
 
-type VehicleStateChangeRequest struct {
+type ChangeRequest struct {
 	LockID       string
-	State        VehicleState
+	State        State
 	Operation    RequestOperation
 	LockTTL      time.Duration
 	receivedAt   time.Time
@@ -127,10 +132,10 @@ const (
 type VehicleStateChangeResponse struct {
 	LockID string
 	Error  string
-	State  VehicleState
+	State  State
 }
 
-func (h *VehicleStateChangeHandler) Init(ctx context.Context) error {
+func (h *ChangeHandler) Init(ctx context.Context) error {
 	rp := &rollbacksPull{}
 	defer rp.rollback()
 	vehiclesToHandle, err := h.getVehiclesToHandle(ctx, rp)
@@ -150,9 +155,9 @@ func (h *VehicleStateChangeHandler) Init(ctx context.Context) error {
 	return nil
 }
 
-func (h *VehicleStateChangeHandler) GetState(ctx context.Context, vehicleID string) (VehicleState, error) {
+func (h *ChangeHandler) GetState(ctx context.Context, vehicleID string) (State, error) {
 	responseChan := make(chan VehicleStateChangeResponse, 1)
-	req := VehicleStateChangeRequest{Operation: RequestOperationGet, ResponseChan: responseChan}
+	req := ChangeRequest{Operation: RequestOperationGet, ResponseChan: responseChan}
 	if err := h.publisher.Publish(ctx, vehicleID, req); err != nil {
 		return "", errors.Wrapf(err, `failed to publish request: [req: %+v, topic: %s]`, req, vehicleID)
 	}
@@ -166,17 +171,9 @@ func (h *VehicleStateChangeHandler) GetState(ctx context.Context, vehicleID stri
 	return resp.State, nil
 }
 
-type UserRole string
-
-const (
-	UserRoleAdmin   UserRole = "Admin"
-	UserRoleEndUser UserRole = "End-user"
-	UserRoleHunter  UserRole = "Hunter"
-)
-
-func (h *VehicleStateChangeHandler) UpdateState(ctx context.Context, vehicleID string, s VehicleState, r UserRole) error {
+func (h *ChangeHandler) UpdateState(ctx context.Context, vehicleID string, s State, r user.Role) error {
 	respChan := make(chan VehicleStateChangeResponse, 1)
-	req := VehicleStateChangeRequest{Operation: RequestOperationGetAndLock, ResponseChan: respChan}
+	req := ChangeRequest{Operation: RequestOperationGetAndLock, ResponseChan: respChan}
 	if err := h.publisher.Publish(ctx, vehicleID, req); err != nil {
 		return errors.Wrapf(err, `failed to publish request: [req: %+v]`, err)
 	}
@@ -190,8 +187,17 @@ func (h *VehicleStateChangeHandler) UpdateState(ctx context.Context, vehicleID s
 	if err = checkIsStateCanBeChanged(resp.State, s, r); err != nil {
 		return err
 	}
+	if s == Ready {
+		batteryLevel, err := h.batteryLevelChecker.CheckBatteryLevel(ctx, vehicleID)
+		if err != nil {
+			return errors.Wrapf(err, `failed to check battery level: [vehicle_id: %s]`, vehicleID)
+		}
+		if batteryLevel < h.batteryLimitForReady {
+			s = BatteryLow
+		}
+	}
 	respChan = make(chan VehicleStateChangeResponse, 1)
-	req = VehicleStateChangeRequest{Operation: RequestOperationUpdate, State: s, ResponseChan: respChan, LockID: resp.LockID}
+	req = ChangeRequest{Operation: RequestOperationUpdate, State: s, ResponseChan: respChan, LockID: resp.LockID}
 	if err = h.publisher.Publish(ctx, vehicleID, req); err != nil {
 		return errors.Wrapf(err, `failed to publish request: [req: %+v]`, err)
 	}
@@ -213,39 +219,39 @@ func (e ErrNotAllowedStateChange) Error() string {
 	return e.message
 }
 
-func NewErrNotAllowedStateChange(r UserRole, current, required VehicleState) ErrNotAllowedStateChange {
+func NewErrNotAllowedStateChange(r user.Role, current, required State) ErrNotAllowedStateChange {
 	return ErrNotAllowedStateChange{message: fmt.Sprintf(`user with role %s can not change state from %s to %s`, r, current, required)}
 }
 
-func checkIsStateCanBeChanged(current, required VehicleState, r UserRole) error {
-	if r == UserRoleAdmin {
+func checkIsStateCanBeChanged(current, required State, r user.Role) error {
+	if r == user.RoleAdmin {
 		return nil
 	}
 
-	if r == UserRoleEndUser {
-		allowedStatesForEndUsers := map[VehicleState]bool{
-			VehicleStateRiding: true,
-			VehicleStateReady:  true,
+	if r == user.RoleEndUser {
+		allowedStatesForEndUsers := map[State]bool{
+			Riding: true,
+			Ready:  true,
 		}
 		if !allowedStatesForEndUsers[current] || !allowedStatesForEndUsers[required] {
 			return NewErrNotAllowedStateChange(r, current, required)
 		}
 	}
 	switch current {
-	case VehicleStateReady:
-		if required == VehicleStateRiding {
+	case Ready:
+		if required == Riding {
 			return nil
 		}
-	case VehicleStateRiding, VehicleStateDropped:
-		if required == VehicleStateReady {
+	case Riding, Dropped:
+		if required == Ready {
 			return nil
 		}
-	case VehicleStateCollected:
-		if required == VehicleStateDropped {
+	case Collected:
+		if required == Dropped {
 			return nil
 		}
-	case VehicleStateBounty:
-		if required == VehicleStateCollected {
+	case Bounty:
+		if required == Collected {
 			return nil
 		}
 	}
@@ -268,13 +274,13 @@ func waitResponseWithTimeout(c <-chan VehicleStateChangeResponse, t time.Duratio
 	}
 }
 
-func (h *VehicleStateChangeHandler) handleStateChange(ctx context.Context, v Vehicle, requestChan <-chan VehicleStateChangeRequest) {
+func (h *ChangeHandler) handleStateChange(ctx context.Context, v Vehicle, requestChan <-chan ChangeRequest) {
 	unknownStateTick := h.tickGetter.GetUnknownStateTick(v.LastStateUpdatedAt)
 	lateTick := h.tickGetter.GetLateTick(v.TimeLocation)
 	var lateTickDone bool
 	currentState := v.State
 	var lockID string
-	var waitingLocks []VehicleStateChangeRequest
+	var waitingLocks []ChangeRequest
 	lockTTLChan := make(<-chan time.Time, 0)
 	for {
 		select {
@@ -283,16 +289,16 @@ func (h *VehicleStateChangeHandler) handleStateChange(ctx context.Context, v Veh
 				log.Println(fmt.Sprintf(`failed to update handled to false: [vehicle_id: %s]`, v.ID))
 			}
 		case <-unknownStateTick:
-			currentState = VehicleStateUnknown
+			currentState = Unknown
 			if err := h.vehicleRepo.UpdateState(ctx, v.ID, currentState); err != nil {
 				log.Println(fmt.Sprintf(`failed to update vehicle state: [vehicle_id: %s, state: %s]`, v.ID, currentState))
 			}
 		case <-lateTick:
-			if currentState != VehicleStateReady {
+			if currentState != Ready {
 				lateTickDone = true
 				break
 			}
-			currentState = VehicleStateBounty
+			currentState = Bounty
 			if err := h.vehicleRepo.UpdateState(ctx, v.ID, currentState); err != nil {
 				log.Println(fmt.Sprintf(`failed to update vehicle state: [vehicle_id: %s, state: %s]`, v.ID, currentState))
 			}
@@ -339,7 +345,7 @@ func (h *VehicleStateChangeHandler) handleStateChange(ctx context.Context, v Veh
 				}
 				currentState = req.State
 				if bounty {
-					currentState = VehicleStateBounty
+					currentState = Bounty
 				}
 				now := time.Now().UTC()
 				if err = h.vehicleRepo.UpdateStateAndLastStateUpdatedAt(ctx, v.ID, currentState, now); err != nil {
@@ -356,24 +362,17 @@ func (h *VehicleStateChangeHandler) handleStateChange(ctx context.Context, v Veh
 	return
 }
 
-func (h *VehicleStateChangeHandler) shouldSetBounty(ctx context.Context, vehicleID string, requiredState, currentState VehicleState, lateTickDone bool) (bool, error) {
-	if requiredState == VehicleStateReady && lateTickDone {
+func (h *ChangeHandler) shouldSetBounty(ctx context.Context, vehicleID string, requiredState, currentState State, lateTickDone bool) (bool, error) {
+	if requiredState == Ready && lateTickDone {
 		return true, nil
 	}
-	if currentState != VehicleStateRiding {
+	if currentState != BatteryLow {
 		return false, nil
 	}
-	v, err := h.vehicleRepo.GetVehicle(ctx, vehicleID)
-	if err != nil {
-		return false, errors.Wrapf(err, `failed to get vehicle: [id: %s]`, vehicleID)
-	}
-	if v.BatteryLevel < h.batteryLimitForReady {
-		return true, nil
-	}
-	return false, nil
+	return true, nil
 }
 
-func (h *VehicleStateChangeHandler) getVehiclesToHandle(ctx context.Context, rp *rollbacksPull) ([]Vehicle, error) {
+func (h *ChangeHandler) getVehiclesToHandle(ctx context.Context, rp *rollbacksPull) ([]Vehicle, error) {
 	var vehiclesToHandle []Vehicle
 	for {
 		if len(vehiclesToHandle) == h.handledVehiclesLimit {
@@ -401,7 +400,7 @@ func (h *VehicleStateChangeHandler) getVehiclesToHandle(ctx context.Context, rp 
 	return vehiclesToHandle, nil
 }
 
-func (h *VehicleStateChangeHandler) acquireVehicleForHandling(ctx context.Context, id string, rp *rollbacksPull) (bool, error) {
+func (h *ChangeHandler) acquireVehicleForHandling(ctx context.Context, id string, rp *rollbacksPull) (bool, error) {
 	lockEntry := vehicleHandlingLock{VehicleID: id, CreatedAt: time.Now().UTC()}
 	err := h.lockRepo.Create(ctx, lockEntry)
 	switch errors.Cause(err).(type) {
